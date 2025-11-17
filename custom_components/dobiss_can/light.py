@@ -105,8 +105,13 @@ class DobissLight(LightEntity):
         # Capabilities
         if self._module_type == MODULE_TYPE_DIMMER:
             self._attr_supported_color_modes = {ColorMode.BRIGHTNESS}
+            self._attr_color_mode = ColorMode.BRIGHTNESS
+            # Enable polling for dimmers so HA asks for state; spontaneous
+            # bus updates for dimmer changes are not guaranteed.
+            self._attr_should_poll = True
         else:
             self._attr_supported_color_modes = {ColorMode.ONOFF}
+            self._attr_color_mode = ColorMode.ONOFF
 
     @property
     def is_on(self) -> bool:
@@ -164,6 +169,8 @@ class DobissLight(LightEntity):
         # The update cycle must be blocked on the CAN bus lock.
         async with self._lock:
             try:
+                # Clear previous wait flag to ensure we wait for the next reply
+                self._event_update.clear()
                 # Inform handler that we expect an update.
                 self._awaiting_update = True
                 # Small delay, otherwise we overload the CAN module.
