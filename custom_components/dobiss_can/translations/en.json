@@ -18,7 +18,34 @@
         },
         "description": "Add a light, uncheck the box to stop adding.",
         "title": "Add a light"
+      },
+      "import_method": {
+        "data": {
+          "method": "Configuration method"
+        },
+        "description": "Choose how you want to configure your Dobiss lights. Importing from config.dobiss is much faster and ensures all names and settings match your Dobiss configuration.",
+        "title": "Configuration Method"
+      },
+      "upload_config": {
+        "data": {
+          "config_file": "config.dobiss file"
+        },
+        "description": "Upload your config.dobiss file from the Dobiss Ambiance software. On Windows, it's typically located at: {location}",
+        "title": "Upload config.dobiss"
+      },
+      "select_outputs": {
+        "data": {
+          "selected": "Select outputs to import"
+        },
+        "description": "Found {count} outputs. Select which ones you want to add to Home Assistant. All are selected by default.",
+        "title": "Select Outputs"
       }
+    },
+    "error": {
+      "no_file": "Please select a file",
+      "no_outputs": "No outputs found in config file",
+      "parse_error": "Failed to parse config.dobiss file. Make sure it's a valid Dobiss configuration file.",
+      "unknown": "Unexpected error occurred"
     }
   }
 }
