@@ -76,15 +76,48 @@ def parse_config_file(file_path: str) -> List[DobissOutput]:
     # Build ID map for resolving z:Ref cross-references
     id_map = _build_id_map(root)
     
+    # Build name map for outputs defined in _subject elements
+    name_map = _build_name_map(root)
+    
+    # Collect all output elements - both <Output> and those defined inline in <_subject>
+    output_elements = []
+    
+    # Standard Output elements
+    for output_elem in root.findall('.//{http://schemas.datacontract.org/2004/07/AmbianceUI.Data}Output'):
+        output_elements.append(output_elem)
+    
+    # Also check _subject elements that define outputs inline (like Bureau werklamp)
+    for subject_elem in root.findall('.//{http://schemas.datacontract.org/2004/07/AmbianceUI.Data}_subject'):
+        # Check if this subject IS an output type
+        output_type_attr = subject_elem.get('{http://www.w3.org/2001/XMLSchema-instance}type')
+        if output_type_attr in OUTPUT_TYPE_MAP:
+            output_elements.append(subject_elem)
+    
     # Extract all outputs
     outputs = []
-    # Search for Output elements with proper namespace
-    for output_elem in root.findall('.//{http://schemas.datacontract.org/2004/07/AmbianceUI.Data}Output'):
-        output = _extract_output(output_elem, id_map)
+    skipped_count = 0
+    skipped_types = {}
+    
+    for output_elem in output_elements:
+        output_type_attr = output_elem.get('{http://www.w3.org/2001/XMLSchema-instance}type')
+        output = _extract_output(output_elem, id_map, name_map)
+        
         if output:
             outputs.append(output)
+        else:
+            skipped_count += 1
+            if output_type_attr:
+                skipped_types[output_type_attr] = skipped_types.get(output_type_attr, 0) + 1
+            
+            # Log the name of skipped outputs for debugging
+            name_elem = output_elem.find('{http://schemas.datacontract.org/2004/07/AmbianceUI.Data}_displayName')
+            if name_elem is not None and name_elem.text:
+                _LOGGER.debug(f"Skipped output '{name_elem.text}' with type '{output_type_attr}'")
     
-    _LOGGER.debug(f"Parsed {len(outputs)} outputs from config.dobiss")
+    _LOGGER.debug(f"Parsed {len(outputs)} outputs from config.dobiss, skipped {skipped_count}")
+    if skipped_types:
+        _LOGGER.debug(f"Skipped types: {skipped_types}")
+    
     return outputs
 
 
@@ -98,13 +131,37 @@ def _build_id_map(root: ET.Element) -> Dict[str, ET.Element]:
     return id_map
 
 
-def _extract_output(elem: ET.Element, id_map: Dict[str, ET.Element]) -> Optional[DobissOutput]:
+def _build_name_map(root: ET.Element) -> Dict[str, str]:
+    """Build a mapping of z:Id to display names found in _subject elements.
+    
+    Some outputs are defined inline within button actions and have their
+    _displayName there instead of in the main Output element.
+    """
+    name_map = {}
+    
+    # Find all _subject elements that contain Output definitions
+    for subject in root.findall('.//{http://schemas.datacontract.org/2004/07/AmbianceUI.Data}_subject'):
+        z_id = subject.get('{http://schemas.microsoft.com/2003/10/Serialization/}Id')
+        if not z_id:
+            continue
+            
+        # Check if this subject has a _displayName
+        name_elem = subject.find('{http://schemas.datacontract.org/2004/07/AmbianceUI.Data}_displayName')
+        if name_elem is not None and name_elem.text:
+            name_map[z_id] = name_elem.text
+            _LOGGER.debug(f"Found name '{name_elem.text}' for subject z:Id={z_id}")
+    
+    return name_map
+
+
+def _extract_output(elem: ET.Element, id_map: Dict[str, ET.Element], name_map: Dict[str, str]) -> Optional[DobissOutput]:
     """
     Extract output information from an Output XML element.
     
     Args:
         elem: The Output XML element
         id_map: Map of z:Id to elements for resolving references
+        name_map: Map of z:Id to display names from _subject elements
         
     Returns:
         DobissOutput object or None if element cannot be parsed
@@ -128,12 +185,21 @@ def _extract_output(elem: ET.Element, id_map: Dict[str, ET.Element]) -> Optional
         _LOGGER.warning(f"Invalid output ID: {output_id_elem.text}")
         return None
     
-    # Extract name
+    # Extract name - first try _displayName, then fall back to name_map
+    name = None
     name_elem = elem.find('{http://schemas.datacontract.org/2004/07/AmbianceUI.Data}_displayName')
-    if name_elem is None or not name_elem.text:
+    if name_elem is not None and name_elem.text:
+        name = name_elem.text
+    else:
+        # Check if this element has a z:Id and try to find name in name_map
+        z_id = elem.get('{http://schemas.microsoft.com/2003/10/Serialization/}Id')
+        if z_id and z_id in name_map:
+            name = name_map[z_id]
+            _LOGGER.debug(f"Using name from subject map: '{name}' for z:Id={z_id}")
+    
+    if not name:
         _LOGGER.warning(f"Output {output_id} missing name")
         return None
-    name = name_elem.text
     
     # Extract parent module information
     parent_elem = elem.find('{http://schemas.datacontract.org/2004/07/AmbianceUI.Data}Parent')

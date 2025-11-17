@@ -34,17 +34,19 @@ async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry, asyn
     # Setting bitrate might work, but ideally that should also be set already.
     # We only care about messages related to feedback from a SET command or the reply from a GET command.
     # Run in executor to avoid blocking I/O warning
-    bus = await hass.async_add_executor_job(
-        can.Bus,
-        data[CONF_INTERFACE],  # bustype
-        data[CONF_CHANNEL],    # channel
-        125000,                # bitrate
-        True,                  # receive_own_messages
-        [                      # can_filters
-            {"can_id": 0x0002FF01, "can_mask": 0x1FFFFFFF, "extended": True},  # Reply to SET
-            {"can_id": 0x01FDFF01, "can_mask": 0x1FFFFFFF, "extended": True},  # Reply to GET
-        ]
-    )
+    def create_bus():
+        return can.Bus(
+            bustype=data[CONF_INTERFACE],
+            channel=data[CONF_CHANNEL],
+            bitrate=125000,
+            receive_own_messages=True,
+            can_filters=[
+                {"can_id": 0x0002FF01, "can_mask": 0x1FFFFFFF, "extended": True},  # Reply to SET
+                {"can_id": 0x01FDFF01, "can_mask": 0x1FFFFFFF, "extended": True},  # Reply to GET
+            ]
+        )
+    
+    bus = await hass.async_add_executor_job(create_bus)
 
     # Global CAN bus lock, required since the reply to a GET does not include any differentiator.
     # This means we must lock, then send out a GET request.
