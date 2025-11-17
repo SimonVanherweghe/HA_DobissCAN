@@ -1,4 +1,5 @@
 import logging
+import os
 from typing import Any, Dict, Optional
 
 import homeassistant.helpers.config_validation as cv
@@ -38,6 +39,26 @@ class DobissCANConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         self.data: Dict[str, Any] = {}
         self.parsed_outputs: Optional[list[DobissOutput]] = None
 
+    def _resolve_file_path(self, value: str) -> str:
+        """Resolve a FileSelector value or upload ID to an absolute path.
+
+        - Absolute path: returned as-is
+        - Relative path: resolved against HA config directory
+        - Upload ID (hash-like string): mapped to .storage/uploads/<id>
+        """
+        if not value:
+            return value
+        # Absolute path
+        if os.path.isabs(value):
+            return value
+        # Relative to config dir
+        candidate = self.hass.config.path(value)
+        if os.path.exists(candidate):
+            return candidate
+        # Treat as upload token
+        from homeassistant.helpers.storage import STORAGE_DIR
+        return self.hass.config.path(STORAGE_DIR, "uploads", value)
+
     async def async_step_user(self, user_input=None):
         _LOGGER.warning("async_step_user %r %r", user_input, self.data)
 
@@ -73,8 +94,9 @@ class DobissCANConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         
         if user_input is not None:
             try:
-                # Get the uploaded file path
-                file_path = user_input.get("config_file")
+                # Get the uploaded file path or upload ID
+                raw_value = user_input.get("config_file")
+                file_path = self._resolve_file_path(raw_value)
                 if not file_path:
                     errors["base"] = "no_file"
                 else:
@@ -326,7 +348,8 @@ class DobissOptionsFlowHandler(config_entries.OptionsFlow):
         errors = {}
         if user_input is not None:
             try:
-                file_path = user_input.get("config_file")
+                raw_value = user_input.get("config_file")
+                file_path = self._resolve_file_path(raw_value)
                 replace_all = user_input.get("replace_all", False)
                 if not file_path:
                     errors["base"] = "no_file"
