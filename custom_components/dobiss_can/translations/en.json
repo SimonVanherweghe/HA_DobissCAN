@@ -39,6 +39,51 @@
         },
         "description": "Found {count} outputs. Select which ones you want to add to Home Assistant. All are selected by default.",
         "title": "Select Outputs"
+      },
+      "init": {
+        "data": {
+          "action": "Action"
+        },
+        "description": "Manage your Dobiss lights. Current lights: {count}.",
+        "title": "Manage Lights"
+      },
+      "add": {
+        "title": "Add Light"
+      },
+      "pick_edit": {
+        "data": {
+          "light": "Select a light to edit"
+        },
+        "title": "Pick Light"
+      },
+      "edit": {
+        "title": "Edit Light"
+      },
+      "delete": {
+        "data": {
+          "selected": "Select lights to delete"
+        },
+        "title": "Delete Lights"
+      },
+      "reimport_upload": {
+        "data": {
+          "config_file": "config.dobiss file",
+          "replace_all": "Replace existing lights"
+        },
+        "title": "Upload config.dobiss"
+      },
+      "reimport_select": {
+        "data": {
+          "selected": "Select outputs to import"
+        },
+        "title": "Select Outputs"
+      },
+      "export": {
+        "data": {
+          "csv": "CSV"
+        },
+        "description": "Copy the CSV below.",
+        "title": "Export CSV"
       }
     },
     "error": {
