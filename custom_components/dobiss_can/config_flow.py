@@ -36,7 +36,7 @@ class DobissCANConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         super().__init__()
         _LOGGER.warning("DobissCANConfigFlow 2")
         self.data: Dict[str, Any] = {}
-    self.parsed_outputs: Optional[list[DobissOutput]] = None
+        self.parsed_outputs: Optional[list[DobissOutput]] = None
 
     async def async_step_user(self, user_input=None):
         _LOGGER.warning("async_step_user %r %r", user_input, self.data)

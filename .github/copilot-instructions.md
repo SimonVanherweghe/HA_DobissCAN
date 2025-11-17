@@ -2,24 +2,28 @@
 
 ## Project Overview
 
-This is a Home Assistant custom component that integrates Dobiss home automation systems via CAN bus communication. It provides local push control of Dobiss modules (currently lights only) using the `python-can` library at 125kbit/s.
+This is a Home Assistant custom component that integrates Dobiss home automation systems via CAN bus communication. It provides local push control of Dobiss modules using the `python-can` library at 125kbit/s. It supports relay and dimmer lights, bulk import from `config.dobiss`, and an options flow for CRUD management.
 
 ## Architecture
 
 ### Core Components
 
 - **`__init__.py`**: Entry point that stores config data in `hass.data[DOMAIN][entry_id]` and forwards setup to the light platform
-- **`config_flow.py`**: Multi-step UI config flow (CAN settings → add multiple lights iteratively)
-- **`light.py`**: Main implementation with CAN bus communication, state management, and entity creation
+- **`config_flow.py`**: Multi-step UI config flow (CAN settings → import from `config.dobiss` or manual → select outputs). Includes Options Flow to add/edit/delete lights, re-import, and CSV export.
+- **`light.py`**: Main implementation with CAN bus communication, state management, dimmer support (brightness/transition), and entity creation
 - **`const.py`**: Domain constants and config keys
+- **`protocol.py`**: Helpers to build SET/GET frames and convert brightness (HA 0–255 ↔ Dobiss 0–100)
 
 ### Critical Design Patterns
 
 **CAN Bus Communication**
 
 - All CAN messages use extended IDs (29-bit)
-- SET command: `0x01FC0002 | (module << 8)` with 5-byte payload
-- GET command: `0x01FCFF01` to query relay state
+- SET command base ID: `0x01FC0002 | (module << 8)`; payload for this integration is 8 bytes: `[module, output, action, delay_on, delay_off, value, softdim, 0xFF]`
+  - `action`: 0x00=Off, 0x01=On, 0x02=Toggle
+  - `value`: 0–100 for dim level (relays use 0 or 100)
+  - `softdim`: 0xFF instant, otherwise transition speed; this integration maps HA `transition` seconds to `softdim = seconds*10` clamped 0–255
+- GET command: `0x01FCFF01` with payload `[module, output]` to request state
 - Filters registered: `0x0002FF01` (SET replies), `0x01FDFF01` (GET replies)
 - Protocol details: https://gist.github.com/dries007/436fcd0549a52f26137bca942fef771a
 
@@ -28,28 +32,32 @@ A critical architectural constraint exists in `light.py`: GET replies don't incl
 
 **State Management**
 
-- Each `DobissLight` maintains internal `_is_on` state
-- SET replies are filtered by module+relay in payload bytes [0] and [1]
-- GET replies rely on the lock pattern described above
+- Each `DobissLight` maintains internal `_is_on` state and (for dimmers) `_brightness` (HA 0–255)
+- SET replies are filtered by module+relay in payload bytes [0] and [1] and update on/off
+- GET replies rely on the lock pattern described above and update on/off; brightness is tracked optimistically when setting levels since replies don’t include level
 - `is_on` setter calls `async_write_ha_state()` to push updates to HA
 
 ### Config Flow Behavior
 
-Two-step process:
+Three phases:
 
 1. **User step**: Collect `interface` (default: "socketcan") and `channel` (default: "can0")
-2. **Light step**: Loop adding lights with `name`, `module` (1-indexed), and `relay` (0-indexed) until user unchecks "add_another"
+2. **Import method**: Choose import from `config.dobiss` (recommended) or manual
+3. **Select outputs / Manual light loop**:
+
+- Import: upload `config.dobiss`, select outputs to add; module type and area are imported
+- Manual: add lights iteratively with `name`, `module` (1-indexed), `relay` (0-indexed), optional `module_type`, `area`
 
 Example config data structure:
 
 ```python
 {
-    "interface": "socketcan",
-    "channel": "can0",
-    "lights": [
-        {"name": "Living Room", "module": 1, "relay": 0},
-        {"name": "Kitchen", "module": 1, "relay": 1}
-    ]
+  "interface": "socketcan",
+  "channel": "can0",
+  "lights": [
+    {"name": "Living Room", "module": 1, "relay": 0, "module_type": 16, "area": "Downstairs"},
+    {"name": "Kitchen", "module": 1, "relay": 1, "module_type": 8}
+  ]
 }
 ```
 
@@ -117,11 +125,7 @@ To add covers/switches/etc beyond lights:
 4. Update config flow to collect device-specific parameters
 
 **Dimmer Support**
-Current protocol only handles on/off (byte 2 in SET payload: 0 or 1). Dimming would require protocol investigation and updating:
-
-- SET payload format (likely byte 2 becomes 0-255)
-- `LightEntity` to use brightness features
-- Config flow to identify dimmable vs toggle relays
+Implemented. `LightEntity` advertises `ColorMode.BRIGHTNESS` for dimmer outputs. HA brightness (0–255) converts to Dobiss (0–100). Optional `transition` maps to the `softdim` byte.
 
 ## External Dependencies
 
