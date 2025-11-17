@@ -33,10 +33,20 @@ async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry, asyn
     # Load CAN bus. Must be operational already (done by external network tool).
     # Setting bitrate might work, but ideally that should also be set already.
     # We only care about messages related to feedback from a SET command or the reply from a GET command.
-    bus = can.Bus(bustype=data[CONF_INTERFACE], channel=data[CONF_CHANNEL], bitrate=125000, receive_own_messages=True, can_filters=[
-        {"can_id": 0x0002FF01, "can_mask": 0x1FFFFFFF, "extended": True},  # Reply to SET
-        {"can_id": 0x01FDFF01, "can_mask": 0x1FFFFFFF, "extended": True},  # Reply to GET
-    ])
+    # Run in executor to avoid blocking I/O warning
+    def create_bus():
+        return can.Bus(
+            bustype=data[CONF_INTERFACE],
+            channel=data[CONF_CHANNEL],
+            bitrate=125000,
+            receive_own_messages=True,
+            can_filters=[
+                {"can_id": 0x0002FF01, "can_mask": 0x1FFFFFFF, "extended": True},  # Reply to SET
+                {"can_id": 0x01FDFF01, "can_mask": 0x1FFFFFFF, "extended": True},  # Reply to GET
+            ]
+        )
+    
+    bus = await hass.async_add_executor_job(create_bus)
 
     # Global CAN bus lock, required since the reply to a GET does not include any differentiator.
     # This means we must lock, then send out a GET request.
@@ -95,8 +105,13 @@ class DobissLight(LightEntity):
         # Capabilities
         if self._module_type == MODULE_TYPE_DIMMER:
             self._attr_supported_color_modes = {ColorMode.BRIGHTNESS}
+            self._attr_color_mode = ColorMode.BRIGHTNESS
+            # Enable polling for dimmers so HA asks for state; spontaneous
+            # bus updates for dimmer changes are not guaranteed.
+            self._attr_should_poll = True
         else:
             self._attr_supported_color_modes = {ColorMode.ONOFF}
+            self._attr_color_mode = ColorMode.ONOFF
 
     @property
     def is_on(self) -> bool:
@@ -154,6 +169,8 @@ class DobissLight(LightEntity):
         # The update cycle must be blocked on the CAN bus lock.
         async with self._lock:
             try:
+                # Clear previous wait flag to ensure we wait for the next reply
+                self._event_update.clear()
                 # Inform handler that we expect an update.
                 self._awaiting_update = True
                 # Small delay, otherwise we overload the CAN module.

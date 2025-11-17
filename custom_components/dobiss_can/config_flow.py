@@ -1,4 +1,5 @@
 import logging
+import os
 from typing import Any, Dict, Optional
 
 import homeassistant.helpers.config_validation as cv
@@ -38,6 +39,45 @@ class DobissCANConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         self.data: Dict[str, Any] = {}
         self.parsed_outputs: Optional[list[DobissOutput]] = None
 
+    def _resolve_file_path(self, value: str) -> str:
+        """Resolve a FileSelector value or upload ID to an absolute path.
+
+        - Absolute path: returned as-is
+        - Relative path: resolved against HA config directory
+        - Upload ID (hash-like string): mapped to .storage/uploads/<id>
+        """
+        if not value:
+            return value
+        
+        _LOGGER.debug(f"Resolving file path for value: {value}")
+        
+        # Absolute path
+        if os.path.isabs(value):
+            _LOGGER.debug(f"Value is absolute path: {value}")
+            return value
+        
+        # Relative to config dir
+        candidate = self.hass.config.path(value)
+        if os.path.exists(candidate):
+            _LOGGER.debug(f"Found as relative path: {candidate}")
+            return candidate
+        
+        # Try as direct upload ID first
+        upload_path = self.hass.config.path(".storage", "uploads", value)
+        if os.path.exists(upload_path):
+            _LOGGER.debug(f"Found upload at: {upload_path}")
+            return upload_path
+        
+        # Also check /media/uploads (alternative upload location)
+        media_path = self.hass.config.path("media", "uploads", value)
+        if os.path.exists(media_path):
+            _LOGGER.debug(f"Found in media uploads: {media_path}")
+            return media_path
+        
+        # Log what we tried
+        _LOGGER.warning(f"File not found. Tried: {upload_path}, {media_path}")
+        return upload_path  # Return first attempt even if not found, for error reporting
+
     async def async_step_user(self, user_input=None):
         _LOGGER.warning("async_step_user %r %r", user_input, self.data)
 
@@ -73,27 +113,52 @@ class DobissCANConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         
         if user_input is not None:
             try:
-                # Get the uploaded file path
-                file_path = user_input.get("config_file")
-                if not file_path:
+                # Get the uploaded file ID
+                file_id = user_input.get("config_file")
+                _LOGGER.debug(f"Upload config received file ID: {file_id}")
+                
+                if not file_id:
                     errors["base"] = "no_file"
                 else:
-                    # Parse the config file
-                    self.parsed_outputs = await self.hass.async_add_executor_job(
-                        parse_config_file, file_path
-                    )
+                    # Read file content directly using the file_upload integration
+                    try:
+                        from homeassistant.components.file_upload import process_uploaded_file
+                        
+                        # Process the uploaded file and get the content
+                        with process_uploaded_file(self.hass, file_id) as file_path:
+                            _LOGGER.debug(f"Processing uploaded file at: {file_path}")
+                            # Parse the config file
+                            self.parsed_outputs = await self.hass.async_add_executor_job(
+                                parse_config_file, file_path
+                            )
+                            
+                            if not self.parsed_outputs:
+                                errors["base"] = "no_outputs"
+                            else:
+                                _LOGGER.info(f"Parsed {len(self.parsed_outputs)} outputs from config.dobiss")
+                                return await self.async_step_select_outputs()
                     
-                    if not self.parsed_outputs:
-                        errors["base"] = "no_outputs"
-                    else:
-                        _LOGGER.info(f"Parsed {len(self.parsed_outputs)} outputs from config.dobiss")
-                        return await self.async_step_select_outputs()
+                    except ImportError:
+                        # Fallback for older HA versions - try direct path resolution
+                        _LOGGER.warning("file_upload component not available, trying direct path")
+                        file_path = self._resolve_file_path(file_id)
+                        if os.path.exists(file_path):
+                            self.parsed_outputs = await self.hass.async_add_executor_job(
+                                parse_config_file, file_path
+                            )
+                            if not self.parsed_outputs:
+                                errors["base"] = "no_outputs"
+                            else:
+                                _LOGGER.info(f"Parsed {len(self.parsed_outputs)} outputs from config.dobiss")
+                                return await self.async_step_select_outputs()
+                        else:
+                            errors["base"] = "no_file"
             
             except ConfigParseError as err:
                 _LOGGER.error(f"Failed to parse config.dobiss: {err}")
                 errors["base"] = "parse_error"
             except Exception as err:
-                _LOGGER.error(f"Unexpected error parsing config.dobiss: {err}")
+                _LOGGER.error(f"Unexpected error parsing config.dobiss: {err}", exc_info=True)
                 errors["base"] = "unknown"
         
         return self.async_show_form(
@@ -326,21 +391,41 @@ class DobissOptionsFlowHandler(config_entries.OptionsFlow):
         errors = {}
         if user_input is not None:
             try:
-                file_path = user_input.get("config_file")
+                file_id = user_input.get("config_file")
                 replace_all = user_input.get("replace_all", False)
-                if not file_path:
+                
+                if not file_id:
                     errors["base"] = "no_file"
                 else:
-                    self._parsed_outputs = await self.hass.async_add_executor_job(parse_config_file, file_path)
-                    if not self._parsed_outputs:
-                        errors["base"] = "no_outputs"
-                    else:
-                        # Store flag for later
-                        self._replace_all = replace_all
-                        return await self.async_step_reimport_select()
+                    try:
+                        from homeassistant.components.file_upload import process_uploaded_file
+                        
+                        with process_uploaded_file(self.hass, file_id) as file_path:
+                            self._parsed_outputs = await self.hass.async_add_executor_job(parse_config_file, file_path)
+                            
+                            if not self._parsed_outputs:
+                                errors["base"] = "no_outputs"
+                            else:
+                                self._replace_all = replace_all
+                                return await self.async_step_reimport_select()
+                    
+                    except ImportError:
+                        _LOGGER.warning("file_upload component not available, trying direct path")
+                        file_path = self._resolve_file_path(file_id)
+                        if os.path.exists(file_path):
+                            self._parsed_outputs = await self.hass.async_add_executor_job(parse_config_file, file_path)
+                            if not self._parsed_outputs:
+                                errors["base"] = "no_outputs"
+                            else:
+                                self._replace_all = replace_all
+                                return await self.async_step_reimport_select()
+                        else:
+                            errors["base"] = "no_file"
+                            
             except ConfigParseError:
                 errors["base"] = "parse_error"
-            except Exception:
+            except Exception as err:
+                _LOGGER.error(f"Unexpected error in reimport: {err}", exc_info=True)
                 errors["base"] = "unknown"
 
         return self.async_show_form(
