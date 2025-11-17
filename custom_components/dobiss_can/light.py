@@ -12,13 +12,14 @@ import logging
 from typing import Any
 
 import can
-from homeassistant.components.light import LightEntity
+from homeassistant.components.light import ATTR_BRIGHTNESS, ATTR_TRANSITION, ColorMode, LightEntity
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_LIGHTS, CONF_NAME, EVENT_HOMEASSISTANT_STOP
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .const import *
+from .protocol import to_dobiss_brightness, build_set_command
 
 
 _LOGGER = logging.getLogger(DOMAIN)
@@ -76,6 +77,7 @@ class DobissLight(LightEntity):
         self._name: str = o[CONF_NAME]
         self._module = o[CONF_MODULE]
         self._relay = o[CONF_RELAY]
+        self._module_type = o.get(CONF_MODULE_TYPE)
         # Prepare fixed ids & payloads
         self._set_id: int = 0x01FC0002 | (self._module << 8)
         self._bytes_off: bytes = bytes((self._module, self._relay, 0, 0xFF, 0xFF))
@@ -83,12 +85,18 @@ class DobissLight(LightEntity):
         self._bytes_status: bytes = bytes((self._module, self._relay))
         # Internal state of light
         self._is_on: bool = False
+        self._brightness: int | None = None
         # Internals to do locking & support GET operation
         self._awaiting_update = False
         self._event_update = asyncio.Event()
         # Logger
         self._log = _LOGGER.getChild(self._name)
         self._attr_unique_id = f"dobiss.{prefix}.{self._module}.{self._relay}"
+        # Capabilities
+        if self._module_type == MODULE_TYPE_DIMMER:
+            self._attr_supported_color_modes = {ColorMode.BRIGHTNESS}
+        else:
+            self._attr_supported_color_modes = {ColorMode.ONOFF}
 
     @property
     def is_on(self) -> bool:
@@ -104,16 +112,39 @@ class DobissLight(LightEntity):
     def unique_id(self) -> str:
         return self._attr_unique_id
 
+    @property
+    def brightness(self) -> int | None:
+        if getattr(self, "_attr_supported_color_modes", None) and ColorMode.BRIGHTNESS in self._attr_supported_color_modes:
+            return self._brightness if self._is_on else 0 if self._brightness else None
+        return None
+
     async def async_turn_on(self, **kwargs: Any) -> None:
-        self._bus.send(can.Message(arbitration_id=self._set_id, data=self._bytes_on, is_extended_id=True), timeout=.1)
+        # If dimmer, allow brightness and transition
+        if getattr(self, "_attr_supported_color_modes", None) and ColorMode.BRIGHTNESS in self._attr_supported_color_modes:
+            ha_brightness = kwargs.get(ATTR_BRIGHTNESS, self._brightness if self._brightness else 255)
+            level = to_dobiss_brightness(ha_brightness)
+            transition = kwargs.get(ATTR_TRANSITION)
+            softdim = 0xFF if transition is None else max(0, min(255, int(round(float(transition) * 10))))
+            arb_id, data = build_set_command(self._module, self._relay, action=0x01, value=level, softdim=softdim)
+            self._bus.send(can.Message(arbitration_id=arb_id, data=data, is_extended_id=True), timeout=.1)
+            # Optimistically update local brightness; on/off will be updated by reply
+            self._brightness = max(1, min(255, ha_brightness)) if ha_brightness is not None else self._brightness or 255
+        else:
+            self._bus.send(can.Message(arbitration_id=self._set_id, data=self._bytes_on, is_extended_id=True), timeout=.1)
 
     async def async_turn_off(self, **kwargs: Any) -> None:
-        self._bus.send(can.Message(arbitration_id=self._set_id, data=self._bytes_off, is_extended_id=True), timeout=.1)
+        if getattr(self, "_attr_supported_color_modes", None) and ColorMode.BRIGHTNESS in self._attr_supported_color_modes:
+            arb_id, data = build_set_command(self._module, self._relay, action=0x00, value=0x00)
+            self._bus.send(can.Message(arbitration_id=arb_id, data=data, is_extended_id=True), timeout=.1)
+        else:
+            self._bus.send(can.Message(arbitration_id=self._set_id, data=self._bytes_off, is_extended_id=True), timeout=.1)
 
     def on_can_message_received(self, msg: can.Message):
         # Reply to SET, this we can filter because data contains data from.
         if msg.arbitration_id == 0x0002FF01 and msg.data[0] == self._module and msg.data[1] == self._relay:
             self.is_on = msg.data[2] == 1
+            if not self._is_on and getattr(self, "_attr_supported_color_modes", None) and ColorMode.BRIGHTNESS in self._attr_supported_color_modes:
+                self._brightness = 0
         # Reply to GET, this we can only filter by _knowing_ that we are waiting on an update.
         if msg.arbitration_id == 0x01FDFF01 and self._awaiting_update:
             self.is_on = msg.data[0] == 1
