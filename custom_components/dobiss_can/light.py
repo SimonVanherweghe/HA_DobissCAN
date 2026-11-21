@@ -9,6 +9,7 @@ Licence: MIT
 """
 import asyncio
 import logging
+import time
 from typing import Any
 
 import can
@@ -17,9 +18,16 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_LIGHTS, CONF_NAME, EVENT_HOMEASSISTANT_STOP
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.event import async_call_later
 
 from .const import *
-from .protocol import to_dobiss_brightness, build_set_command
+from .protocol import to_dobiss_brightness, to_ha_brightness, build_set_command
+
+# A dimmer module soft-dims to its new level (measured: 0 -> 100 % in ~1.5-2 s).
+# A GET sent during that ramp returns an intermediate level (e.g. 0x01 right after
+# 'on', 0x28 right after 'off' from 50 %), so after a SET we trust the command and
+# only read the module back once the ramp has settled.
+DIMMER_SETTLE_SECONDS = 2.5
 
 
 _LOGGER = logging.getLogger(DOMAIN)
@@ -99,6 +107,9 @@ class DobissLight(LightEntity):
         # Internals to do locking & support GET operation
         self._awaiting_update = False
         self._event_update = asyncio.Event()
+        # Dimmer ramp handling: skip polls until the ramp is done, then re-read.
+        self._settle_until: float = 0.0
+        self._unsub_settle = None
         # Logger
         self._log = _LOGGER.getChild(self._name)
         self._attr_unique_id = f"dobiss.{prefix}.{self._module}.{self._relay}"
@@ -128,10 +139,33 @@ class DobissLight(LightEntity):
         return self._attr_unique_id
 
     @property
+    def _is_dimmer(self) -> bool:
+        return self._module_type == MODULE_TYPE_DIMMER
+
+    @property
     def brightness(self) -> int | None:
-        if getattr(self, "_attr_supported_color_modes", None) and ColorMode.BRIGHTNESS in self._attr_supported_color_modes:
-            return self._brightness if self._is_on else 0 if self._brightness else None
+        if self._is_dimmer and self._is_on:
+            return self._brightness
         return None
+
+    def _settle_then_refresh(self, transition: float | None) -> None:
+        """After a SET on a dimmer: hold off polling until the ramp is done, then re-read."""
+        delay = DIMMER_SETTLE_SECONDS + (float(transition) if transition else 0.0)
+        self._settle_until = time.monotonic() + delay
+        if self._unsub_settle:
+            self._unsub_settle()
+        self._unsub_settle = async_call_later(self.hass, delay, self._settled)
+
+    @callback
+    def _settled(self, _now) -> None:
+        self._unsub_settle = None
+        self._settle_until = 0.0
+        self.async_schedule_update_ha_state(True)
+
+    async def async_will_remove_from_hass(self) -> None:
+        if self._unsub_settle:
+            self._unsub_settle()
+            self._unsub_settle = None
 
     async def async_turn_on(self, **kwargs: Any) -> None:
         # If dimmer, allow brightness and transition
@@ -142,8 +176,12 @@ class DobissLight(LightEntity):
             softdim = 0xFF if transition is None else max(0, min(255, int(round(float(transition) * 10))))
             arb_id, data = build_set_command(self._module, self._relay, action=0x01, value=level, softdim=softdim)
             self._bus.send(can.Message(arbitration_id=arb_id, data=data, is_extended_id=True), timeout=.1)
-            # Optimistically update local brightness; on/off will be updated by reply
+            # The module sends no reply to a SET, and a GET during the ramp is wrong:
+            # update optimistically and verify once the ramp has settled.
             self._brightness = max(1, min(255, ha_brightness)) if ha_brightness is not None else self._brightness or 255
+            self._is_on = True
+            self._settle_then_refresh(transition)
+            self.async_write_ha_state()
         else:
             self._bus.send(can.Message(arbitration_id=self._set_id, data=self._bytes_on, is_extended_id=True), timeout=.1)
 
@@ -151,6 +189,9 @@ class DobissLight(LightEntity):
         if getattr(self, "_attr_supported_color_modes", None) and ColorMode.BRIGHTNESS in self._attr_supported_color_modes:
             arb_id, data = build_set_command(self._module, self._relay, action=0x00, value=0x00)
             self._bus.send(can.Message(arbitration_id=arb_id, data=data, is_extended_id=True), timeout=.1)
+            self._is_on = False
+            self._settle_then_refresh(None)
+            self.async_write_ha_state()
         else:
             self._bus.send(can.Message(arbitration_id=self._set_id, data=self._bytes_off, is_extended_id=True), timeout=.1)
 
@@ -158,14 +199,23 @@ class DobissLight(LightEntity):
         # Reply to SET, this we can filter because data contains data from.
         if msg.arbitration_id == 0x0002FF01 and msg.data[0] == self._module and msg.data[1] == self._relay:
             self.is_on = msg.data[2] == 1
-            if not self._is_on and getattr(self, "_attr_supported_color_modes", None) and ColorMode.BRIGHTNESS in self._attr_supported_color_modes:
-                self._brightness = 0
         # Reply to GET, this we can only filter by _knowing_ that we are waiting on an update.
         if msg.arbitration_id == 0x01FDFF01 and self._awaiting_update:
-            self.is_on = msg.data[0] == 1
+            if self._is_dimmer:
+                # A dimmer answers with its level in percent (0x00-0x64), not 0/1.
+                level = msg.data[0]
+                if level > 0:
+                    self._brightness = to_ha_brightness(level)
+                # level 0: keep the last brightness so a plain 'on' restores it
+                self.is_on = level > 0
+            else:
+                self.is_on = msg.data[0] == 1
             self._event_update.set()
 
     async def async_update(self):
+        # Dimmer still ramping after our own SET: a read now returns a transient level.
+        if self._is_dimmer and time.monotonic() < self._settle_until:
+            return
         # The update cycle must be blocked on the CAN bus lock.
         async with self._lock:
             try:
