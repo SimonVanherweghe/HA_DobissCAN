@@ -29,6 +29,10 @@ from .protocol import to_dobiss_brightness, to_ha_brightness, build_set_command
 # only read the module back once the ramp has settled.
 DIMMER_SETTLE_SECONDS = 2.5
 
+# SET command id is 0x01FC0002 | (module << 8); the mask leaves the module byte open.
+SET_ID_BASE = 0x01FC0002
+SET_ID_MASK = 0x1FFF00FF
+
 
 _LOGGER = logging.getLogger(DOMAIN)
 _LOGGER.setLevel(logging.DEBUG)
@@ -51,6 +55,10 @@ async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry, asyn
             can_filters=[
                 {"can_id": 0x0002FF01, "can_mask": 0x1FFFFFFF, "extended": True},  # Reply to SET
                 {"can_id": 0x01FDFF01, "can_mask": 0x1FFFFFFF, "extended": True},  # Reply to GET
+                # SET to any module (01FC<module>02): wall buttons go through the master as a
+                # plain SET. Relays confirm that with a reply-to-SET, dimmers never do, so a
+                # dimmer can only learn about a wall press by seeing the SET itself.
+                {"can_id": SET_ID_BASE, "can_mask": SET_ID_MASK, "extended": True},
             ]
         )
     
@@ -195,7 +203,36 @@ class DobissLight(LightEntity):
         else:
             self._bus.send(can.Message(arbitration_id=self._set_id, data=self._bytes_off, is_extended_id=True), timeout=.1)
 
+    def _on_bus_set(self, data: bytearray) -> None:
+        """A SET for this dimmer from someone else (wall button via the master, another controller)."""
+        if self.hass is None:  # notifier starts before the entities are added
+            return
+        action = data[2]
+        if action == 0x00:
+            self._is_on = False
+        elif action == 0x01:
+            if len(data) >= 6 and 0 < data[5] <= 0x64:
+                self._brightness = to_ha_brightness(data[5])
+            self._is_on = True
+        elif action == 0x02:
+            self._is_on = not self._is_on
+        else:
+            return
+        # softdim byte is in tenths of a second; 0xFF = module default ramp
+        transition = data[6] / 10 if len(data) >= 7 and data[6] != 0xFF else None
+        self._settle_then_refresh(transition)
+        self.async_write_ha_state()
+
     def on_can_message_received(self, msg: can.Message):
+        # SET seen on the bus. Our own SETs loop back too (receive_own_messages); that is
+        # harmless, since HA only sends explicit on/off (never toggle), so re-applying it
+        # is idempotent. Don't filter on msg.is_rx: socketcan marks every frame created on
+        # this host as not-rx, so it can't tell our socket from another local sender.
+        if (msg.arbitration_id & SET_ID_MASK) == SET_ID_BASE:
+            if (self._is_dimmer and len(msg.data) >= 3
+                    and msg.data[0] == self._module and msg.data[1] == self._relay):
+                self._on_bus_set(msg.data)
+            return
         # Reply to SET, this we can filter because data contains data from.
         if msg.arbitration_id == 0x0002FF01 and msg.data[0] == self._module and msg.data[1] == self._relay:
             self.is_on = msg.data[2] == 1
